@@ -159,10 +159,11 @@ jobs:
                   return c.getString(c.getResources().getIdentifier(name, "string", c.getPackageName()));
               }
 
-              private final ServiceConnection conn = new ServiceConnection() {
+              private final Object lock = new Object();
+          private final ServiceConnection conn = new ServiceConnection() {
                   @Override public void onServiceConnected(ComponentName n, IBinder b) {
                       svc = IInAppBillingService.Stub.asInterface(b);
-                      synchronized (conn) { conn.notifyAll(); }
+                      synchronized (lock) { lock.notifyAll(); }
                   }
                   @Override public void onServiceDisconnected(ComponentName n) { svc = null; }
               };
@@ -174,7 +175,7 @@ jobs:
                       Intent i = new Intent(res("pay_bind_action"));
                       i.setPackage(res("pay_store_pkg"));
                       if (!getContext().bindService(i, conn, Context.BIND_AUTO_CREATE)) return false;
-                      synchronized (conn) { if (svc == null) conn.wait(8000); }
+                      synchronized (lock) { if (svc == null) lock.wait(8000); }
                   } catch (Exception e) { return false; }
                   return svc != null;
               }
@@ -387,5 +388,4 @@ jobs:
           # ---------- 4) خرید درون‌برنامه‌ای (مایکت / بازار) ----------
           STORES = {
               "myket":  dict(pkg="ir.mservices.market", action="ir.mservices.market.InAppBillingService.BIND",
-                             perm="ir.mservices.market.BILLING"),
-              "bazaar": dict(
+                             perm="ir.mserv
