@@ -11,6 +11,8 @@ on:
         type: choice
         options: [myket, bazaar]
         default: myket
+permissions:
+  contents: write
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -386,4 +388,4 @@ jobs:
           STORES = {
               "myket":  dict(pkg="ir.mservices.market", action="ir.mservices.market.InAppBillingService.BIND",
                              perm="ir.mservices.market.BILLING"),
-              "bazaar": dict(pkg="com.farsitel.bazaar", acti
+              "bazaar": dict(
