@@ -388,4 +388,95 @@ jobs:
           # ---------- 4) خرید درون‌برنامه‌ای (مایکت / بازار) ----------
           STORES = {
               "myket":  dict(pkg="ir.mservices.market", action="ir.mservices.market.InAppBillingService.BIND",
-                             perm="ir.mserv
+                             perm="ir.mservices.market.BILLING"),
+              "bazaar": dict(pkg="com.farsitel.bazaar", action="ir.cafebazaar.pardakht.InAppBillingService.BIND",
+                             perm="com.farsitel.bazaar.permission.PAY_THROUGH_BAZAAR"),
+          }
+          store = (os.environ.get("STORE") or "myket").strip().lower()
+          if store not in STORES:
+              sys.exit(f"STORE نامعتبره: {store} (myket یا bazaar)")
+          st = STORES[store]
+          # کلید عمومی RSA فروشگاه (عمومیه، مخفی نیست). با Secret به اسم STORE_PUBLIC_KEY می‌شه عوضش کرد.
+          DEFAULT_PUBLIC_KEY = "MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQDj9eSnYQxdMc92CTdl73PXemTlkT1pQZFKYUL/QHLX8cxLhEjuogu0SrEbYwM/sRLh+Ffqij8Fr0a1+EIks2uYCr4iJmtqrP13i92nxrtaSc9GVRMgvA9/Ldu5T4qDH7YSOP1OTlvOhu31NT/2Od3KoOKzjobtbaYNYPnxNNAhpQIDAQAB"
+          pub = (os.environ.get("STORE_PUBLIC_KEY") or DEFAULT_PUBLIC_KEY).strip()
+
+          # فایل AIDL
+          aidl_dir = APP / "aidl" / "com" / "android" / "vending" / "billing"
+          aidl_dir.mkdir(parents=True, exist_ok=True)
+          shutil.copy(NATIVE / "IInAppBillingService.aidl", aidl_dir / "IInAppBillingService.aidl")
+
+          # رشته‌های فروشگاه
+          (RES / "values" / "pay.xml").write_text(
+              '<?xml version="1.0" encoding="utf-8"?>\n<resources>\n'
+              f'    <string name="pay_store_pkg" translatable="false">{st["pkg"]}</string>\n'
+              f'    <string name="pay_bind_action" translatable="false">{st["action"]}</string>\n'
+              f'    <string name="pay_public_key" translatable="false">{pub}</string>\n</resources>\n',
+              encoding="utf-8",
+          )
+
+          # مجوز + queries در منیفست
+          m = manifest.read_text(encoding="utf-8")
+          if st["perm"] not in m:
+              block = (f'    <uses-permission android:name="{st["perm"]}" />\n'
+                       f'    <queries>\n        <package android:name="{st["pkg"]}" />\n    </queries>\n\n    ')
+              m = m.replace("<application", block + "<application", 1)
+              manifest.write_text(m, encoding="utf-8")
+
+          # فعال کردن AIDL در gradle
+          gradle = ANDROID / "app" / "build.gradle"
+          g = gradle.read_text(encoding="utf-8")
+          if "aidl true" not in g and "aidl = true" not in g:
+              g = re.sub(r"(?m)^android\s*\{", "android {\n    buildFeatures {\n        aidl true\n    }", g, count=1)
+              gradle.write_text(g, encoding="utf-8")
+
+          print(f"OK: icon + landscape + fullscreen + billing({store}) applied")
+          NIMA_EOF_4
+
+      - name: Hook payment into index.html
+        run: |
+          python3 - <<'PYX'
+          p="www/index.html"
+          s=open(p,encoding="utf-8").read()
+          if "pay-bridge.js" not in s:
+              old="var PAY_READY=false;"
+              assert old in s, "PAY_READY پیدا نشد"
+              s=s.replace(old,"var PAY_READY=!!(window.Capacitor&&Capacitor.isNativePlatform&&Capacitor.isNativePlatform());",1)
+              s=s.replace("<head>",'<head>\n<script src="pay-bridge.js"></script>',1)
+              open(p,"w",encoding="utf-8").write(s)
+          PYX
+      - run: npm install
+      - run: npx cap add android
+      - name: Patch android
+        env:
+          STORE: ${{ github.event.inputs.store || 'myket' }}
+        run: python3 scripts/patch_android.py
+      - run: npx cap sync android
+      - run: chmod +x android/gradlew && cd android && ./gradlew assembleDebug assembleRelease
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app-debug-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+      - name: Sign release APK
+        if: env.KS_B64 != ''
+        env:
+          KS_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          echo "$KS_B64" | base64 -d > release.jks
+          BT=$(ls -d $ANDROID_HOME/build-tools/* | sort -V | tail -1)
+          $BT/zipalign -p 4 android/app/build/outputs/apk/release/app-release-unsigned.apk aligned.apk
+          $BT/apksigner sign --ks release.jks --ks-pass pass:"$KS_PASS" --ks-key-alias "$KEY_ALIAS" --key-pass pass:"$KEY_PASS" --out app-release.apk aligned.apk
+      - uses: actions/upload-artifact@v4
+        if: env.KS_B64 != ''
+        with:
+          name: app-release-apk
+          path: app-release.apk
+      - name: Publish APK to GitHub Releases (direct download)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp android/app/build/outputs/apk/debug/app-debug.apk Nima2-debug.apk
+          FILES="Nima2-debug.apk"
+          if [ -f app-release.apk ]; then cp app-release.apk Nima2-release.apk; FILES="$FILES Nima2-release.apk"; fi
+          gh release create "build-${{ github.run_number }}" $FILES --title "Build ${{ github.run_number }}" --notes "APK ساخته‌شده خودکار" --prerelease
