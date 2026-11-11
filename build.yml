@@ -1,0 +1,389 @@
+name: Build APK
+# این فایل رو بذار تو .github/workflows/build.yml. اگه zip پروژه تو ریشهٔ ریپو باشه، خودش بازش می‌کنه و بیلد می‌گیره.
+# همه‌چیز (پلاگین خرید مایکت، آیکن، افقی، تمام‌صفحه) موقع بیلد خودش ساخته می‌شه.
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      store:
+        description: "فروشگاه برای خرید درون‌برنامه‌ای"
+        type: choice
+        options: [myket, bazaar]
+        default: myket
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      KS_B64: ${{ secrets.KEYSTORE_BASE64 }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unzip project zip from repo (if any)
+        run: |
+          shopt -s nullglob
+          zips=(*.zip)
+          if [ ${#zips[@]} -eq 0 ]; then echo "no zip in repo root; using repo files as-is"; exit 0; fi
+          echo "using: ${zips[0]}"
+          rm -rf _z && mkdir _z && unzip -q -o "${zips[0]}" -d _z
+          # اگه همه‌چیز داخل یک پوشه بود، همون پوشه رو بردار
+          if [ "$(ls -A _z | wc -l)" -eq 1 ] && [ -d "_z/$(ls -A _z)" ]; then SRC="_z/$(ls -A _z)"; else SRC=_z; fi
+          rm -rf "$SRC/.github" "$SRC/android" "$SRC/node_modules"
+          cp -a "$SRC"/. .
+          rm -rf _z
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: 17 }
+      - name: Write billing files
+        run: |
+          mkdir -p $(dirname native/IInAppBillingService.aidl)
+          cat > native/IInAppBillingService.aidl <<'NIMA_EOF_0'
+          package com.android.vending.billing;
+
+          import android.os.Bundle;
+
+          // پروتکل استاندارد In-App Billing v3 (مایکت و بازار هر دو همین رو پیاده کردن).
+          // ترتیب متدها نباید عوض بشه.
+          interface IInAppBillingService {
+              int isBillingSupported(int apiVersion, String packageName, String type);
+              Bundle getSkuDetails(int apiVersion, String packageName, String type, in Bundle skusBundle);
+              Bundle getBuyIntent(int apiVersion, String packageName, String sku, String type, String developerPayload);
+              Bundle getPurchases(int apiVersion, String packageName, String type, String continuationToken);
+              int consumePurchase(int apiVersion, String packageName, String purchaseToken);
+          }
+          NIMA_EOF_0
+          mkdir -p $(dirname native/MainActivity.java.tpl)
+          cat > native/MainActivity.java.tpl <<'NIMA_EOF_1'
+          package __APP_ID__;
+
+          import android.content.Intent;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.view.WindowManager;
+
+          import androidx.core.view.WindowCompat;
+          import androidx.core.view.WindowInsetsCompat;
+          import androidx.core.view.WindowInsetsControllerCompat;
+
+          import com.getcapacitor.BridgeActivity;
+
+          public class MainActivity extends BridgeActivity {
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  registerPlugin(NimaPayPlugin.class);
+                  super.onCreate(savedInstanceState);
+                  if (Build.VERSION.SDK_INT >= 28) {
+                      WindowManager.LayoutParams lp = getWindow().getAttributes();
+                      lp.layoutInDisplayCutoutMode =
+                          WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
+                      getWindow().setAttributes(lp);
+                  }
+                  hideSystemBars();
+              }
+
+              @Override
+              public void onActivityResult(int requestCode, int resultCode, Intent data) {
+                  NimaPayPlugin p = NimaPayPlugin.INSTANCE;
+                  if (p != null && p.handleResult(requestCode, resultCode, data)) return;
+                  super.onActivityResult(requestCode, resultCode, data);
+              }
+
+              @Override
+              public void onWindowFocusChanged(boolean hasFocus) {
+                  super.onWindowFocusChanged(hasFocus);
+                  if (hasFocus) hideSystemBars();
+              }
+
+              private void hideSystemBars() {
+                  WindowCompat.setDecorFitsSystemWindows(getWindow(), false);
+                  WindowInsetsControllerCompat c =
+                      WindowCompat.getInsetsController(getWindow(), getWindow().getDecorView());
+                  c.setSystemBarsBehavior(WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
+                  c.hide(WindowInsetsCompat.Type.systemBars());
+              }
+          }
+          NIMA_EOF_1
+          mkdir -p $(dirname native/NimaPayPlugin.java.tpl)
+          cat > native/NimaPayPlugin.java.tpl <<'NIMA_EOF_2'
+          package __APP_ID__;
+
+          import android.app.Activity;
+          import android.app.PendingIntent;
+          import android.content.ComponentName;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.content.ServiceConnection;
+          import android.os.Bundle;
+          import android.os.IBinder;
+          import android.util.Base64;
+
+          import com.android.vending.billing.IInAppBillingService;
+          import com.getcapacitor.JSObject;
+          import com.getcapacitor.Plugin;
+          import com.getcapacitor.PluginCall;
+          import com.getcapacitor.PluginMethod;
+          import com.getcapacitor.annotation.CapacitorPlugin;
+
+          import org.json.JSONObject;
+
+          import java.security.KeyFactory;
+          import java.security.PublicKey;
+          import java.security.Signature;
+          import java.security.spec.X509EncodedKeySpec;
+          import java.util.ArrayList;
+
+          /** پل خرید درون‌برنامه‌ای (مایکت / بازار) — بدون هیچ کتابخانهٔ خارجی. */
+          @CapacitorPlugin(name = "NimaPay")
+          public class NimaPayPlugin extends Plugin {
+              static final int REQ = 7391;
+              static NimaPayPlugin INSTANCE;
+
+              private IInAppBillingService svc;
+              private PluginCall pending;
+              private String pendingSku;
+
+              @Override
+              public void load() { INSTANCE = this; }
+
+              @Override
+              protected void handleOnDestroy() {
+                  try { if (svc != null) getContext().unbindService(conn); } catch (Exception ignored) {}
+                  svc = null;
+                  INSTANCE = null;
+              }
+
+              private String res(String name) {
+                  Context c = getContext();
+                  return c.getString(c.getResources().getIdentifier(name, "string", c.getPackageName()));
+              }
+
+              private final ServiceConnection conn = new ServiceConnection() {
+                  @Override public void onServiceConnected(ComponentName n, IBinder b) {
+                      svc = IInAppBillingService.Stub.asInterface(b);
+                      synchronized (conn) { conn.notifyAll(); }
+                  }
+                  @Override public void onServiceDisconnected(ComponentName n) { svc = null; }
+              };
+
+              /** اتصال به سرویس فروشگاه (روی ترد پس‌زمینه صدا بزن). */
+              private boolean connect() {
+                  if (svc != null) return true;
+                  try {
+                      Intent i = new Intent(res("pay_bind_action"));
+                      i.setPackage(res("pay_store_pkg"));
+                      if (!getContext().bindService(i, conn, Context.BIND_AUTO_CREATE)) return false;
+                      synchronized (conn) { if (svc == null) conn.wait(8000); }
+                  } catch (Exception e) { return false; }
+                  return svc != null;
+              }
+
+              private void fail(PluginCall call, String msg) {
+                  if (call == null) return;
+                  call.reject(msg);
+                  try { getBridge().releaseCall(call); } catch (Exception ignored) {}
+                  if (call == pending) { pending = null; pendingSku = null; }
+              }
+
+              @PluginMethod
+              public void buy(final PluginCall call) {
+                  final String sku = call.getString("sku");
+                  if (sku == null || sku.isEmpty()) { call.reject("شناسهٔ محصول خالیه"); return; }
+                  if (pending != null) { call.reject("یه خرید دیگه در حال انجامه"); return; }
+                  getBridge().saveCall(call);
+                  pending = call; pendingSku = sku;
+                  new Thread(new Runnable() { @Override public void run() {
+                      try {
+                          if (!connect()) { fail(call, "اتصال به فروشگاه برقرار نشد؛ مایکت/بازار نصب و باز باشه"); return; }
+                          String pkg = getContext().getPackageName();
+                          int sup = svc.isBillingSupported(3, pkg, "inapp");
+                          if (sup != 0) { fail(call, "خرید درون‌برنامه‌ای پشتیبانی نمی‌شه (کد " + sup + ")"); return; }
+                          Bundle b = svc.getBuyIntent(3, pkg, sku, "inapp", "nima");
+                          int rc = b.getInt("RESPONSE_CODE", 6);
+                          if (rc == 7) {
+                              // قبلاً خریده‌شده و مصرف‌نشده؛ مصرفش می‌کنیم تا دوباره بشه خرید
+                              if (call.getBoolean("consumable", true)) consumeOwned(sku);
+                              fail(call, "خرید قبلی هنوز بسته نشده بود؛ یه بار دیگه امتحان کن"); return;
+                          }
+                          if (rc != 0) { fail(call, rc == 1 ? "خرید لغو شد" : "خطا در شروع خرید (کد " + rc + ")"); return; }
+                          final PendingIntent pi = b.getParcelable("BUY_INTENT");
+                          if (pi == null) { fail(call, "خطا در باز کردن صفحهٔ پرداخت"); return; }
+                          getActivity().runOnUiThread(new Runnable() { @Override public void run() {
+                              try {
+                                  getActivity().startIntentSenderForResult(pi.getIntentSender(), REQ, new Intent(), 0, 0, 0);
+                              } catch (Exception e) { fail(call, "صفحهٔ پرداخت باز نشد"); }
+                          }});
+                      } catch (Exception e) { fail(call, "خطا: " + e.getMessage()); }
+                  }}).start();
+              }
+
+              /** از MainActivity.onActivityResult صدا زده می‌شه. */
+              boolean handleResult(int requestCode, int resultCode, Intent data) {
+                  if (requestCode != REQ) return false;
+                  PluginCall call = pending; String sku = pendingSku;
+                  if (call == null) return true;
+                  if (data == null) { fail(call, "پرداخت انجام نشد"); return true; }
+                  int rc = data.getIntExtra("RESPONSE_CODE", 6);
+                  String pd = data.getStringExtra("INAPP_PURCHASE_DATA");
+                  String sig = data.getStringExtra("INAPP_DATA_SIGNATURE");
+                  if (resultCode != Activity.RESULT_OK || rc != 0 || pd == null) {
+                      fail(call, rc == 1 || resultCode == Activity.RESULT_CANCELED ? "خرید لغو شد" : "پرداخت انجام نشد (کد " + rc + ")");
+                      return true;
+                  }
+                  try {
+                      JSONObject o = new JSONObject(pd);
+                      if (!sku.equals(o.optString("productId")) || o.optInt("purchaseState", 0) != 0) {
+                          fail(call, "اطلاعات خرید نامعتبره"); return true;
+                      }
+                      String key = res("pay_public_key").trim();
+                      if (!key.isEmpty() && !verify(key, pd, sig)) { fail(call, "امضای خرید تأیید نشد"); return true; }
+                      JSObject r = new JSObject();
+                      r.put("ok", true); r.put("sku", sku); r.put("token", o.optString("purchaseToken"));
+                      call.resolve(r);
+                      try { getBridge().releaseCall(call); } catch (Exception ignored) {}
+                      pending = null; pendingSku = null;
+                  } catch (Exception e) { fail(call, "خطا در پردازش خرید"); }
+                  return true;
+              }
+
+              /** بعد از اینکه بازی جنس رو تحویل داد، JS این رو صدا می‌زنه. */
+              @PluginMethod
+              public void consume(final PluginCall call) {
+                  final String token = call.getString("token");
+                  if (token == null) { call.resolve(); return; }
+                  new Thread(new Runnable() { @Override public void run() {
+                      try {
+                          if (connect()) svc.consumePurchase(3, getContext().getPackageName(), token);
+                      } catch (Exception ignored) {}
+                      call.resolve();
+                  }}).start();
+              }
+
+              private void consumeOwned(String sku) {
+                  try {
+                      String pkg = getContext().getPackageName();
+                      Bundle b = svc.getPurchases(3, pkg, "inapp", null);
+                      if (b.getInt("RESPONSE_CODE", 6) != 0) return;
+                      ArrayList<String> data = b.getStringArrayList("INAPP_PURCHASE_DATA_LIST");
+                      if (data == null) return;
+                      for (String d : data) {
+                          JSONObject o = new JSONObject(d);
+                          if (sku.equals(o.optString("productId"))) svc.consumePurchase(3, pkg, o.optString("purchaseToken"));
+                      }
+                  } catch (Exception ignored) {}
+              }
+
+              private static boolean verify(String base64Key, String data, String sig) {
+                  try {
+                      PublicKey pk = KeyFactory.getInstance("RSA")
+                          .generatePublic(new X509EncodedKeySpec(Base64.decode(base64Key, Base64.DEFAULT)));
+                      Signature s = Signature.getInstance("SHA1withRSA");
+                      s.initVerify(pk); s.update(data.getBytes("UTF-8"));
+                      return sig != null && s.verify(Base64.decode(sig, Base64.DEFAULT));
+                  } catch (Exception e) { return false; }
+              }
+          }
+          NIMA_EOF_2
+          mkdir -p $(dirname www/pay-bridge.js)
+          cat > www/pay-bridge.js <<'NIMA_EOF_3'
+          /* پل پرداخت: فقط داخل APK فعاله (Capacitor + پلاگین NimaPay). روی وب هیچ کاری نمی‌کنه. */
+          (function(){
+            var C=window.Capacitor;
+            if(!(C&&C.isNativePlatform&&C.isNativePlatform()))return;
+            /* شناسهٔ محصول‌هایی که باید توی پنل مایکت/بازار بسازی. consume:false یعنی یک‌بار مصرف نیست (دائمی) */
+            var SKU={
+              coins_c10:{id:"coins_c10",consume:true},   /* بستهٔ ۱۰ هزار سکه  - ۱۵٬۰۰۰ تومان */
+              coins_c20:{id:"coins_c20",consume:true},   /* بستهٔ ۲۰ هزار سکه  - ۲۵٬۰۰۰ تومان */
+              coins_c35:{id:"coins_c35",consume:true},   /* بستهٔ ۳۵ هزار سکه  - ۲۹٬۰۰۰ تومان */
+              vip_w:{id:"vip_w",consume:true},           /* VIP هفتگی  - ۱۵٬۰۰۰ تومان */
+              vip_m:{id:"vip_m",consume:true},           /* VIP ماهانه - ۴۰٬۰۰۰ تومان */
+              vip_q:{id:"vip_q",consume:true},           /* VIP سه‌ماهه - ۱۰۰٬۰۰۰ تومان */
+              message:{id:"message",consume:true},       /* ارسال پیام  - ۳۰٬۰۰۰ تومان */
+              takido:{id:"takido",consume:false}         /* نشان تکیدو فن - ۵٬۰۰۰ تومان (دائمی) */
+            };
+            function note(t){
+              try{
+                var d=document.createElement("div");
+                d.textContent=t; d.setAttribute("dir","rtl");
+                d.style.cssText="position:fixed;left:50%;bottom:24px;transform:translateX(-50%);z-index:2147483647;background:#1b1f2e;color:#fff;padding:10px 18px;border-radius:12px;font:600 14px sans-serif;box-shadow:0 6px 24px #0008;max-width:80vw;text-align:center";
+                document.body.appendChild(d); setTimeout(function(){d.remove()},3200);
+              }catch(e){}
+            }
+            window.NIMA_PAY=function(o,cb){
+              var m=SKU[o.item]||{id:String(o.item),consume:true}, P=C.Plugins&&C.Plugins.NimaPay;
+              if(!P){note("پرداخت در دسترس نیست");cb(false);return}
+              P.buy({sku:m.id,consumable:m.consume}).then(function(r){
+                var ok=!!(r&&r.ok);
+                try{cb(ok)}catch(e){}                       /* اول جنس تحویل بشه */
+                if(ok&&m.consume&&r.token)P.consume({token:r.token}); /* بعد مصرف بشه */
+              }).catch(function(e){
+                note((e&&(e.message||e.errorMessage))||"پرداخت انجام نشد"); cb(false);
+              });
+            };
+          })();
+          NIMA_EOF_3
+          mkdir -p $(dirname scripts/patch_android.py)
+          cat > scripts/patch_android.py <<'NIMA_EOF_4'
+          #!/usr/bin/env python3
+          """بعد از `npx cap add android` اجرا می‌شه و این‌ها رو اعمال می‌کنه:
+            1) آیکن برنامه (از پوشهٔ resources/android)
+            2) حالت افقی (sensorLandscape)
+            3) تمام‌صفحه (مخفی شدن نوار وضعیت و دکمه‌های پایین) + پر کردن ناحیهٔ ناچ
+            4) خرید درون‌برنامه‌ای مایکت/بازار (پلاگین native/NimaPayPlugin + AIDL + مجوزها)
+          """
+          import json, os, re, shutil, sys
+          from pathlib import Path
+
+          ROOT = Path(__file__).resolve().parent.parent
+          ANDROID = ROOT / "android"
+          APP = ANDROID / "app" / "src" / "main"
+          RES = APP / "res"
+
+          if not APP.exists():
+              sys.exit("پوشهٔ android پیدا نشد؛ اول `npx cap add android` رو اجرا کن.")
+
+          app_id = json.loads((ROOT / "capacitor.config.json").read_text(encoding="utf-8"))["appId"]
+
+          # ---------- 1) آیکن ----------
+          src = ROOT / "resources" / "android"
+          for d in src.glob("mipmap-*"):
+              dst = RES / d.name
+              dst.mkdir(parents=True, exist_ok=True)
+              for f in d.glob("*.png"):
+                  shutil.copy(f, dst / f.name)
+          # رنگ پس‌زمینهٔ آیکن تطبیقی (adaptive)
+          (RES / "values").mkdir(parents=True, exist_ok=True)
+          (RES / "values" / "ic_launcher_background.xml").write_text(
+              '<?xml version="1.0" encoding="utf-8"?>\n<resources>\n'
+              '    <color name="ic_launcher_background">#12306E</color>\n</resources>\n',
+              encoding="utf-8",
+          )
+          # ---------- 2) افقی ----------
+          manifest = APP / "AndroidManifest.xml"
+          m = manifest.read_text(encoding="utf-8")
+          m = re.sub(r'\s+android:screenOrientation="[^"]*"', "", m)
+          m = m.replace('android:name=".MainActivity"',
+                        'android:name=".MainActivity"\n            android:screenOrientation="sensorLandscape"', 1)
+          manifest.write_text(m, encoding="utf-8")
+
+          # ---------- 3) تمام‌صفحه ----------
+          styles = RES / "values" / "styles.xml"
+          if styles.exists():
+              s = styles.read_text(encoding="utf-8")
+              item = '<item name="android:windowFullscreen">true</item>'
+              if item not in s:
+                  s = re.sub(r'(<style name="AppTheme\.NoActionBar(?:Launch)?"[^>]*>)',
+                             r'\1\n        ' + item, s)
+                  styles.write_text(s, encoding="utf-8")
+
+          java_dir = APP / "java" / Path(*app_id.split("."))
+          java_dir.mkdir(parents=True, exist_ok=True)
+          NATIVE = ROOT / "native"
+          for tpl, out in (("MainActivity.java.tpl", "MainActivity.java"), ("NimaPayPlugin.java.tpl", "NimaPayPlugin.java")):
+              (java_dir / out).write_text(
+                  (NATIVE / tpl).read_text(encoding="utf-8").replace("__APP_ID__", app_id), encoding="utf-8")
+
+          # ---------- 4) خرید درون‌برنامه‌ای (مایکت / بازار) ----------
+          STORES = {
+              "myket":  dict(pkg="ir.mservices.market", action="ir.mservices.market.InAppBillingService.BIND",
+                             perm="ir.mservices.market.BILLING"),
+              "bazaar": dict(pkg="com.farsitel.bazaar", acti
